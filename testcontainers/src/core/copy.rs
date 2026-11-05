@@ -1,8 +1,12 @@
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
+use tar_framing::{
+    header::{CHECKSUM_RANGE, MODE_RANGE},
+    write::{end_marker_bytes, frame_pax_member_into, payload_padding, PaxMember},
+    UstarKind,
+};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
-use tokio_tar::EntryType;
 
 #[derive(Debug, Clone)]
 pub struct CopyToContainerCollection(Vec<CopyToContainer>);
@@ -35,7 +39,7 @@ pub enum CopyFromContainerError {
     #[error("requested container path is a directory")]
     IsDirectory,
     #[error("archive entry type '{0:?}' is not supported for requested target")]
-    UnsupportedEntry(EntryType),
+    UnsupportedEntry(UstarKind),
 }
 
 /// Abstraction for materializing the bytes read from a source into a concrete destination.
@@ -146,6 +150,41 @@ pub enum CopyToContainerError {
     PathNameError(String),
 }
 
+fn append_tar_header(
+    ar: &mut Vec<u8>,
+    path: &str,
+    kind: UstarKind,
+    size: u64,
+    mode: u32,
+) -> Result<(), CopyToContainerError> {
+    let mut framing = Vec::new();
+    // Each member's byte offset supplies a unique sequence for its pax header name.
+    frame_pax_member_into(
+        ar.len() as u64,
+        PaxMember {
+            path,
+            kind,
+            size,
+            link_path: None,
+            executable: mode & 0o111 != 0,
+        },
+        &mut framing,
+    )
+    .map_err(|error| CopyToContainerError::IoError(std::io::Error::other(error)))?;
+
+    // astral-codec currently encodes executable intent only. Restore the full mode
+    // on the ordinary header (the final block of this member's pax framing).
+    let header_start = framing.len() - tar_framing::BLOCK_SIZE;
+    let header = &mut framing[header_start..];
+    let mode = format!("{:07o}\0", mode & 0o7777);
+    header[MODE_RANGE].copy_from_slice(mode.as_bytes());
+    header[CHECKSUM_RANGE].fill(b' ');
+    let checksum: u32 = header.iter().map(|byte| u32::from(*byte)).sum();
+    header[CHECKSUM_RANGE].copy_from_slice(format!("{checksum:06o}\0 ").as_bytes());
+    ar.extend_from_slice(&framing);
+    Ok(())
+}
+
 impl CopyToContainerCollection {
     pub fn new(collection: Vec<CopyToContainer>) -> Self {
         Self(collection)
@@ -156,18 +195,17 @@ impl CopyToContainerCollection {
     }
 
     pub(crate) async fn tar(&self) -> Result<bytes::Bytes, CopyToContainerError> {
-        let mut ar = tokio_tar::Builder::new(Vec::new());
-
-        for copy_to_container in &self.0 {
-            copy_to_container.append_tar(&mut ar).await?
+        let mut ar = Vec::new();
+        // BuildKit detects tar contexts from their first 1024 bytes. Start with a
+        // plain ustar directory header so detection need not read past a pax extension.
+        append_tar_header(&mut ar, ".", UstarKind::Directory, 0, 0o755)?;
+        let header_start = ar.len() - tar_framing::BLOCK_SIZE;
+        ar.drain(..header_start);
+        for entry in &self.0 {
+            entry.append_tar(&mut ar).await?;
         }
-
-        let bytes = ar
-            .into_inner()
-            .await
-            .map_err(CopyToContainerError::IoError)?;
-
-        Ok(bytes::Bytes::copy_from_slice(bytes.as_slice()))
+        ar.extend_from_slice(end_marker_bytes());
+        Ok(ar.into())
     }
 }
 
@@ -180,22 +218,13 @@ impl CopyToContainer {
     }
 
     pub(crate) async fn tar(&self) -> Result<bytes::Bytes, CopyToContainerError> {
-        let mut ar = tokio_tar::Builder::new(Vec::new());
-
+        let mut ar = Vec::new();
         self.append_tar(&mut ar).await?;
-
-        let bytes = ar
-            .into_inner()
-            .await
-            .map_err(CopyToContainerError::IoError)?;
-
-        Ok(bytes::Bytes::copy_from_slice(bytes.as_slice()))
+        ar.extend_from_slice(end_marker_bytes());
+        Ok(ar.into())
     }
 
-    pub(crate) async fn append_tar(
-        &self,
-        ar: &mut tokio_tar::Builder<Vec<u8>>,
-    ) -> Result<(), CopyToContainerError> {
+    async fn append_tar(&self, ar: &mut Vec<u8>) -> Result<(), CopyToContainerError> {
         self.source.append_tar(ar, &self.target).await
     }
 }
@@ -249,9 +278,9 @@ impl From<Vec<u8>> for CopyDataSource {
 }
 
 impl CopyDataSource {
-    pub(crate) async fn append_tar(
+    async fn append_tar(
         &self,
-        ar: &mut tokio_tar::Builder<Vec<u8>>,
+        ar: &mut Vec<u8>,
         target: &CopyTargetOptions,
     ) -> Result<(), CopyToContainerError> {
         let target_path = target.target();
@@ -266,7 +295,7 @@ impl CopyDataSource {
                 }
             }
             CopyDataSource::Data(data) => {
-                if let Err(e) = append_tar_bytes(ar, data, target).await {
+                if let Err(e) = append_tar_bytes(ar, data, target) {
                     log::error!("Could not append data to tar: {target_path}");
                     return Err(e);
                 }
@@ -278,66 +307,89 @@ impl CopyDataSource {
 }
 
 async fn append_tar_file(
-    ar: &mut tokio_tar::Builder<Vec<u8>>,
+    ar: &mut Vec<u8>,
     source_file_path: &Path,
     target: &CopyTargetOptions,
 ) -> Result<(), CopyToContainerError> {
-    let target_path = make_path_relative(target.target());
-    let meta = tokio::fs::metadata(source_file_path)
-        .await
-        .map_err(CopyToContainerError::IoError)?;
-
-    if meta.is_dir() {
-        ar.append_dir_all(target_path, source_file_path)
+    let mut pending = vec![(
+        source_file_path.to_path_buf(),
+        make_path_relative(target.target()),
+        target.mode(),
+    )];
+    while let Some((source, path, mode_override)) = pending.pop() {
+        let meta = tokio::fs::metadata(&source)
             .await
             .map_err(CopyToContainerError::IoError)?;
-    } else {
-        let f = &mut tokio::fs::File::open(source_file_path)
-            .await
-            .map_err(CopyToContainerError::IoError)?;
-
-        let mut header = tokio_tar::Header::new_gnu();
-        header.set_size(meta.len());
-
+        let mode_override = if meta.is_dir() { None } else { mode_override };
         #[cfg(unix)]
-        {
+        let mode = {
             use std::os::unix::fs::PermissionsExt;
-            let mode = target.mode().unwrap_or_else(|| meta.permissions().mode());
-            header.set_mode(mode);
-        }
-
+            mode_override.unwrap_or_else(|| meta.permissions().mode())
+        };
         #[cfg(not(unix))]
-        {
-            let mode = target.mode().unwrap_or(0o644);
-            header.set_mode(mode);
+        let mode = mode_override.unwrap_or(if meta.is_dir() { 0o755 } else { 0o644 });
+
+        if meta.is_dir() {
+            if !path.is_empty() {
+                append_tar_header(ar, &path, UstarKind::Directory, 0, mode)?;
+            }
+            let mut entries = tokio::fs::read_dir(&source)
+                .await
+                .map_err(CopyToContainerError::IoError)?;
+            while let Some(entry) = entries
+                .next_entry()
+                .await
+                .map_err(CopyToContainerError::IoError)?
+            {
+                let name = entry.file_name().into_string().map_err(|name| {
+                    CopyToContainerError::PathNameError(name.to_string_lossy().into_owned())
+                })?;
+                let child_path = if path.is_empty() {
+                    name
+                } else {
+                    format!("{path}/{name}")
+                };
+                pending.push((entry.path(), child_path, None));
+            }
+        } else if meta.is_file() {
+            let file = tokio::fs::File::open(&source)
+                .await
+                .map_err(CopyToContainerError::IoError)?;
+            append_tar_header(ar, &path, UstarKind::Regular, meta.len(), mode)?;
+            let copied = tokio::io::copy(&mut file.take(meta.len()), ar)
+                .await
+                .map_err(CopyToContainerError::IoError)?;
+            if copied != meta.len() {
+                return Err(CopyToContainerError::IoError(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "archive source file is truncated",
+                )));
+            }
+            ar.extend_from_slice(payload_padding(meta.len()));
+        } else {
+            return Err(CopyToContainerError::IoError(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "archive source is not a regular file or directory",
+            )));
         }
-
-        header.set_cksum();
-
-        ar.append_data(&mut header, target_path, f)
-            .await
-            .map_err(CopyToContainerError::IoError)?;
-    };
-
+    }
     Ok(())
 }
 
-async fn append_tar_bytes(
-    ar: &mut tokio_tar::Builder<Vec<u8>>,
-    data: &Vec<u8>,
+fn append_tar_bytes(
+    ar: &mut Vec<u8>,
+    data: &[u8],
     target: &CopyTargetOptions,
 ) -> Result<(), CopyToContainerError> {
-    let relative_target_path = make_path_relative(target.target());
-
-    let mut header = tokio_tar::Header::new_gnu();
-    header.set_size(data.len() as u64);
-    header.set_mode(target.mode().unwrap_or(0o0644));
-    header.set_cksum();
-
-    ar.append_data(&mut header, relative_target_path, data.as_slice())
-        .await
-        .map_err(CopyToContainerError::IoError)?;
-
+    append_tar_header(
+        ar,
+        &make_path_relative(target.target()),
+        UstarKind::Regular,
+        data.len() as u64,
+        target.mode().unwrap_or(0o644),
+    )?;
+    ar.extend_from_slice(data);
+    ar.extend_from_slice(payload_padding(data.len() as u64));
     Ok(())
 }
 
@@ -354,9 +406,8 @@ fn make_path_relative(path: &str) -> String {
 mod tests {
     use std::{fs::File, io::Write};
 
-    use futures::StreamExt;
+    use tar_framing::logical::TarReader;
     use tempfile::tempdir;
-    use tokio_tar::Archive;
 
     use super::*;
 
@@ -428,11 +479,10 @@ mod tests {
         let copy_to_container = CopyToContainer::new(data, target);
 
         let tar_bytes = copy_to_container.tar().await.unwrap();
-        let mut archive = Archive::new(std::io::Cursor::new(tar_bytes));
-        let mut entries = archive.entries().unwrap();
-        let entry = entries.next().await.unwrap().unwrap();
+        let mut archive = TarReader::new(std::io::Cursor::new(tar_bytes));
+        let entry = archive.next_frame().await.unwrap().unwrap();
 
-        assert_eq!(entry.header().mode().unwrap(), 0o600);
+        assert_eq!(entry.header.mode.unwrap(), 0o600);
     }
 
     #[tokio::test]
@@ -446,10 +496,9 @@ mod tests {
         let copy_to_container = CopyToContainer::new(file_path, target);
 
         let tar_bytes = copy_to_container.tar().await.unwrap();
-        let mut archive = Archive::new(std::io::Cursor::new(tar_bytes));
-        let mut entries = archive.entries().unwrap();
-        let entry = entries.next().await.unwrap().unwrap();
+        let mut archive = TarReader::new(std::io::Cursor::new(tar_bytes));
+        let entry = archive.next_frame().await.unwrap().unwrap();
 
-        assert_eq!(entry.header().mode().unwrap(), 0o640);
+        assert_eq!(entry.header.mode.unwrap(), 0o640);
     }
 }

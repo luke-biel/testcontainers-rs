@@ -21,12 +21,16 @@ use bollard::{
     Docker,
 };
 use ferroid::{base32::Base32UlidExt, id::ULID};
-use futures::{pin_mut, StreamExt, TryStreamExt};
+use futures::{StreamExt, TryStreamExt};
+use tar_codec::{
+    Archive as _, DecodePolicy, Member, MemberPayload as _, PaxDecodePolicy,
+    PaxVendorExtensionPolicy, SpecialKind, TarArchive,
+};
+use tar_framing::UstarKind;
 use tokio::{
     io::AsyncRead,
     sync::{Mutex, OnceCell},
 };
-use tokio_tar::{Archive as AsyncTarArchive, EntryType};
 use tokio_util::io::StreamReader;
 use url::Url;
 
@@ -463,31 +467,48 @@ impl Client {
         R: AsyncRead + Unpin,
         T: CopyFileFromContainer,
     {
-        let mut archive = AsyncTarArchive::new(reader);
-        let entries = archive.entries().map_err(CopyFromContainerError::Io)?;
-
-        pin_mut!(entries);
-
-        while let Some(entry) = entries
-            .try_next()
-            .await
-            .map_err(CopyFromContainerError::Io)?
-        {
-            match entry.header().entry_type() {
-                EntryType::GNULongName
-                | EntryType::GNULongLink
-                | EntryType::XGlobalHeader
-                | EntryType::XHeader
-                | EntryType::GNUSparse => continue, // skip metadata entries
-                EntryType::Directory => return Err(CopyFromContainerError::IsDirectory),
-                EntryType::Regular | EntryType::Continuous => {
-                    return target.copy_from_reader(entry).await
-                }
-                et => return Err(CopyFromContainerError::UnsupportedEntry(et)),
+        // Docker uses SCHILY.xattr.* records for extended attributes. File copies only
+        // consume the payload, so these attributes do not need to be materialized.
+        let policy = DecodePolicy::default().pax_policy(
+            PaxDecodePolicy::default()
+                .vendor_extension_policy(PaxVendorExtensionPolicy::ignore(["SCHILY"])),
+        );
+        let mut members = TarArchive::new(reader).with_policy(policy).members();
+        let member = members.next().await.map_err(io::Error::other)?;
+        match member {
+            Some(Member::File { payload, .. }) => {
+                let chunks = futures::stream::try_unfold(payload, |mut payload| async move {
+                    let mut buffer = Vec::new();
+                    if payload
+                        .next_chunk(&mut buffer, 64 * 1024)
+                        .await
+                        .map_err(io::Error::other)?
+                    {
+                        Ok::<_, std::io::Error>(Some((bytes::Bytes::from(buffer), payload)))
+                    } else {
+                        Ok(None)
+                    }
+                });
+                target
+                    .copy_from_reader(StreamReader::new(Box::pin(chunks)))
+                    .await
             }
+            Some(Member::Directory { .. }) => Err(CopyFromContainerError::IsDirectory),
+            Some(Member::SymbolicLink { .. }) => Err(CopyFromContainerError::UnsupportedEntry(
+                UstarKind::SymbolicLink,
+            )),
+            Some(Member::HardLink { .. }) => Err(CopyFromContainerError::UnsupportedEntry(
+                UstarKind::HardLink,
+            )),
+            Some(Member::Special { kind, .. }) => {
+                Err(CopyFromContainerError::UnsupportedEntry(match kind {
+                    SpecialKind::CharacterDevice => UstarKind::CharacterDevice,
+                    SpecialKind::BlockDevice => UstarKind::BlockDevice,
+                    SpecialKind::Fifo => UstarKind::Fifo,
+                }))
+            }
+            None => Err(CopyFromContainerError::EmptyArchive),
         }
-
-        Err(CopyFromContainerError::EmptyArchive)
     }
 
     pub(crate) async fn container_is_running(
